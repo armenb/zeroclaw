@@ -1800,6 +1800,8 @@ pub fn create_resilient_provider_with_options(
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
     let mut providers: Vec<(String, Box<dyn Provider>)> = Vec::new();
+    let mut provider_model_overrides: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     let primary_provider = match primary_name {
         "openai-codex" | "openai_codex" | "codex" => {
@@ -1827,6 +1829,10 @@ pub fn create_resilient_provider_with_options(
             .and_then(|pc| pc.models.get(provider_name));
         let config_api_key = model_profile.and_then(|m| m.api_key.as_deref());
         let config_api_url = model_profile.and_then(|m| m.base_url.as_deref());
+
+        if let Some(model) = model_profile.and_then(|m| m.model.as_deref()) {
+            provider_model_overrides.insert(fallback.clone(), model.to_string());
+        }
         // If the profile has a name override (e.g. name = "ollama" for a custom
         // profile key), use it as the actual provider type for the factory.
         let actual_provider_name = model_profile
@@ -1878,7 +1884,8 @@ pub fn create_resilient_provider_with_options(
         reliability.provider_backoff_ms,
     )
     .with_api_keys(reliability.api_keys.clone())
-    .with_model_fallbacks(reliability.model_fallbacks.clone());
+    .with_model_fallbacks(reliability.model_fallbacks.clone())
+    .with_provider_model_overrides(provider_model_overrides);
 
     Ok(Box::new(reliable))
 }

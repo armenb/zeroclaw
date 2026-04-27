@@ -374,6 +374,11 @@ pub struct ReliableProvider {
     key_index: AtomicUsize,
     /// Per-model fallback chains: model_name → [fallback_model_1, fallback_model_2, ...]
     model_fallbacks: HashMap<String, Vec<String>>,
+    /// Per-provider model overrides: provider_name → model to use for that provider.
+    /// When set, overrides the model passed by the caller for the specified provider.
+    /// Populated from `[providers.<name>].model` config entries so each fallback
+    /// provider uses its own configured model instead of the primary's model.
+    provider_model_overrides: HashMap<String, String>,
 }
 
 impl ReliableProvider {
@@ -389,6 +394,7 @@ impl ReliableProvider {
             api_keys: Vec::new(),
             key_index: AtomicUsize::new(0),
             model_fallbacks: HashMap::new(),
+            provider_model_overrides: HashMap::new(),
         }
     }
 
@@ -402,6 +408,22 @@ impl ReliableProvider {
     pub fn with_model_fallbacks(mut self, fallbacks: HashMap<String, Vec<String>>) -> Self {
         self.model_fallbacks = fallbacks;
         self
+    }
+
+    /// Set per-provider model overrides from `[providers.<name>].model` config entries.
+    /// When a provider has an override, it receives its own configured model instead of
+    /// whatever model the caller requested.
+    pub fn with_provider_model_overrides(mut self, overrides: HashMap<String, String>) -> Self {
+        self.provider_model_overrides = overrides;
+        self
+    }
+
+    /// Resolve the effective model for a given provider, applying any per-provider override.
+    fn effective_model<'a>(&'a self, provider_name: &str, requested_model: &'a str) -> &'a str {
+        self.provider_model_overrides
+            .get(provider_name)
+            .map(|s| s.as_str())
+            .unwrap_or(requested_model)
     }
 
     /// Build the list of models to try: [original, fallback1, fallback2, ...]
@@ -462,10 +484,11 @@ impl Provider for ReliableProvider {
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
                 let mut backoff_ms = self.base_backoff_ms;
+                let eff_model = self.effective_model(provider_name, current_model);
 
                 for attempt in 0..=self.max_retries {
                     match provider
-                        .chat_with_system(system_prompt, message, current_model, temperature)
+                        .chat_with_system(system_prompt, message, eff_model, temperature)
                         .await
                     {
                         Ok(resp) => {
@@ -476,7 +499,7 @@ impl Provider for ReliableProvider {
                             {
                                 tracing::info!(
                                     provider = provider_name,
-                                    model = *current_model,
+                                    model = eff_model,
                                     attempt,
                                     original_model = model,
                                     "Provider recovered (failover/retry)"
@@ -490,7 +513,7 @@ impl Provider for ReliableProvider {
                                     primary,
                                     model,
                                     provider_name,
-                                    current_model,
+                                    eff_model,
                                 );
                             }
                             return Ok(resp);
@@ -503,7 +526,7 @@ impl Provider for ReliableProvider {
                                 push_failure(
                                     &mut failures,
                                     provider_name,
-                                    current_model,
+                                    eff_model,
                                     attempt + 1,
                                     self.max_retries + 1,
                                     "non_retryable",
@@ -524,7 +547,7 @@ impl Provider for ReliableProvider {
                             push_failure(
                                 &mut failures,
                                 provider_name,
-                                current_model,
+                                eff_model,
                                 attempt + 1,
                                 self.max_retries + 1,
                                 failure_reason,
@@ -550,7 +573,7 @@ impl Provider for ReliableProvider {
                             if non_retryable {
                                 tracing::warn!(
                                     provider = provider_name,
-                                    model = *current_model,
+                                    model = eff_model,
                                     error = %error_detail,
                                     "Non-retryable error, moving on"
                                 );
@@ -561,7 +584,7 @@ impl Provider for ReliableProvider {
                                 let wait = self.compute_backoff(backoff_ms, &e);
                                 tracing::warn!(
                                     provider = provider_name,
-                                    model = *current_model,
+                                    model = eff_model,
                                     attempt = attempt + 1,
                                     backoff_ms = wait,
                                     reason = failure_reason,
@@ -577,7 +600,7 @@ impl Provider for ReliableProvider {
 
                 tracing::warn!(
                     provider = provider_name,
-                    model = *current_model,
+                    model = eff_model,
                     "Exhausted retries, trying next provider/model"
                 );
             }
@@ -611,10 +634,11 @@ impl Provider for ReliableProvider {
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
                 let mut backoff_ms = self.base_backoff_ms;
+                let eff_model = self.effective_model(provider_name, current_model);
 
                 for attempt in 0..=self.max_retries {
                     match provider
-                        .chat_with_history(&effective_messages, current_model, temperature)
+                        .chat_with_history(&effective_messages, eff_model, temperature)
                         .await
                     {
                         Ok(resp) => {
@@ -626,7 +650,7 @@ impl Provider for ReliableProvider {
                             {
                                 tracing::info!(
                                     provider = provider_name,
-                                    model = *current_model,
+                                    model = eff_model,
                                     attempt,
                                     original_model = model,
                                     context_truncated,
@@ -641,7 +665,7 @@ impl Provider for ReliableProvider {
                                     primary,
                                     model,
                                     provider_name,
-                                    current_model,
+                                    eff_model,
                                 );
                             }
                             return Ok(resp);
@@ -654,7 +678,7 @@ impl Provider for ReliableProvider {
                                     context_truncated = true;
                                     tracing::warn!(
                                         provider = provider_name,
-                                        model = *current_model,
+                                        model = eff_model,
                                         dropped,
                                         remaining = effective_messages.len(),
                                         "Context window exceeded; truncated history and retrying"
@@ -668,7 +692,7 @@ impl Provider for ReliableProvider {
                                 push_failure(
                                     &mut failures,
                                     provider_name,
-                                    current_model,
+                                    eff_model,
                                     attempt + 1,
                                     self.max_retries + 1,
                                     "non_retryable",
@@ -715,7 +739,7 @@ impl Provider for ReliableProvider {
                             if non_retryable {
                                 tracing::warn!(
                                     provider = provider_name,
-                                    model = *current_model,
+                                    model = eff_model,
                                     error = %error_detail,
                                     "Non-retryable error, moving on"
                                 );
@@ -726,7 +750,7 @@ impl Provider for ReliableProvider {
                                 let wait = self.compute_backoff(backoff_ms, &e);
                                 tracing::warn!(
                                     provider = provider_name,
-                                    model = *current_model,
+                                    model = eff_model,
                                     attempt = attempt + 1,
                                     backoff_ms = wait,
                                     reason = failure_reason,
@@ -742,7 +766,7 @@ impl Provider for ReliableProvider {
 
                 tracing::warn!(
                     provider = provider_name,
-                    model = *current_model,
+                    model = eff_model,
                     "Exhausted retries, trying next provider/model"
                 );
             }
@@ -782,10 +806,11 @@ impl Provider for ReliableProvider {
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
                 let mut backoff_ms = self.base_backoff_ms;
+                let eff_model = self.effective_model(provider_name, current_model);
 
                 for attempt in 0..=self.max_retries {
                     match provider
-                        .chat_with_tools(&effective_messages, tools, current_model, temperature)
+                        .chat_with_tools(&effective_messages, tools, eff_model, temperature)
                         .await
                     {
                         Ok(resp) => {
@@ -797,7 +822,7 @@ impl Provider for ReliableProvider {
                             {
                                 tracing::info!(
                                     provider = provider_name,
-                                    model = *current_model,
+                                    model = eff_model,
                                     attempt,
                                     original_model = model,
                                     context_truncated,
@@ -812,7 +837,7 @@ impl Provider for ReliableProvider {
                                     primary,
                                     model,
                                     provider_name,
-                                    current_model,
+                                    eff_model,
                                 );
                             }
                             return Ok(resp);
@@ -825,7 +850,7 @@ impl Provider for ReliableProvider {
                                     context_truncated = true;
                                     tracing::warn!(
                                         provider = provider_name,
-                                        model = *current_model,
+                                        model = eff_model,
                                         dropped,
                                         remaining = effective_messages.len(),
                                         "Context window exceeded; truncated history and retrying"
@@ -839,7 +864,7 @@ impl Provider for ReliableProvider {
                                 push_failure(
                                     &mut failures,
                                     provider_name,
-                                    current_model,
+                                    eff_model,
                                     attempt + 1,
                                     self.max_retries + 1,
                                     "non_retryable",
@@ -886,7 +911,7 @@ impl Provider for ReliableProvider {
                             if non_retryable {
                                 tracing::warn!(
                                     provider = provider_name,
-                                    model = *current_model,
+                                    model = eff_model,
                                     error = %error_detail,
                                     "Non-retryable error, moving on"
                                 );
@@ -897,7 +922,7 @@ impl Provider for ReliableProvider {
                                 let wait = self.compute_backoff(backoff_ms, &e);
                                 tracing::warn!(
                                     provider = provider_name,
-                                    model = *current_model,
+                                    model = eff_model,
                                     attempt = attempt + 1,
                                     backoff_ms = wait,
                                     reason = failure_reason,
@@ -913,7 +938,7 @@ impl Provider for ReliableProvider {
 
                 tracing::warn!(
                     provider = provider_name,
-                    model = *current_model,
+                    model = eff_model,
                     "Exhausted retries, trying next provider/model"
                 );
             }
@@ -939,13 +964,14 @@ impl Provider for ReliableProvider {
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
                 let mut backoff_ms = self.base_backoff_ms;
+                let eff_model = self.effective_model(provider_name, current_model);
 
                 for attempt in 0..=self.max_retries {
                     let req = ChatRequest {
                         messages: &effective_messages,
                         tools: request.tools,
                     };
-                    match provider.chat(req, current_model, temperature).await {
+                    match provider.chat(req, eff_model, temperature).await {
                         Ok(resp) => {
                             if attempt > 0
                                 || *current_model != model
@@ -955,7 +981,7 @@ impl Provider for ReliableProvider {
                             {
                                 tracing::info!(
                                     provider = provider_name,
-                                    model = *current_model,
+                                    model = eff_model,
                                     attempt,
                                     original_model = model,
                                     context_truncated,
@@ -970,7 +996,7 @@ impl Provider for ReliableProvider {
                                     primary,
                                     model,
                                     provider_name,
-                                    current_model,
+                                    eff_model,
                                 );
                             }
                             return Ok(resp);
@@ -983,7 +1009,7 @@ impl Provider for ReliableProvider {
                                     context_truncated = true;
                                     tracing::warn!(
                                         provider = provider_name,
-                                        model = *current_model,
+                                        model = eff_model,
                                         dropped,
                                         remaining = effective_messages.len(),
                                         "Context window exceeded; truncated history and retrying"
@@ -997,7 +1023,7 @@ impl Provider for ReliableProvider {
                                 push_failure(
                                     &mut failures,
                                     provider_name,
-                                    current_model,
+                                    eff_model,
                                     attempt + 1,
                                     self.max_retries + 1,
                                     "non_retryable",
@@ -1044,7 +1070,7 @@ impl Provider for ReliableProvider {
                             if non_retryable {
                                 tracing::warn!(
                                     provider = provider_name,
-                                    model = *current_model,
+                                    model = eff_model,
                                     error = %error_detail,
                                     "Non-retryable error, moving on"
                                 );
@@ -1055,7 +1081,7 @@ impl Provider for ReliableProvider {
                                 let wait = self.compute_backoff(backoff_ms, &e);
                                 tracing::warn!(
                                     provider = provider_name,
-                                    model = *current_model,
+                                    model = eff_model,
                                     attempt = attempt + 1,
                                     backoff_ms = wait,
                                     reason = failure_reason,
@@ -1071,7 +1097,7 @@ impl Provider for ReliableProvider {
 
                 tracing::warn!(
                     provider = provider_name,
-                    model = *current_model,
+                    model = eff_model,
                     "Exhausted retries, trying next provider/model"
                 );
             }
